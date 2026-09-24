@@ -213,6 +213,8 @@ class ProviderExecutor:
             ingress_count_name="message_count",
             ingress_count=len(routed.request.messages),
             request_id=request_id,
+            local_input_tokens=input_tokens,
+            endpoint="/v1/messages",
             open_candidate=open_candidate,
         )
 
@@ -270,6 +272,8 @@ class ProviderExecutor:
             ingress_count_name="input_item_count",
             ingress_count=input_item_count,
             request_id=request_id,
+            local_input_tokens=input_tokens,
+            endpoint="/v1/responses",
             open_candidate=open_candidate,
         )
 
@@ -286,12 +290,21 @@ class ProviderExecutor:
         ingress_count: int,
         request_id: str,
         open_candidate: CandidateStreamOpener,
+        local_input_tokens: int | None = None,
+        endpoint: str = "",
     ) -> AsyncIterator[str]:
         """Start and consume candidates through one protocol-blind lifecycle."""
 
         primary = resolved.primary
         candidates = (primary, *resolved.fallbacks)
         gateway_model = resolved.original_model
+        # Observatory state: which provider/model actually served the request.
+        # Populated as candidates are attempted; the observatory tap reads this
+        # so the event reflects the final (post-fallback) provider/model.
+        observatory_state: dict[str, object] = {
+            "provider_id": primary.provider_id,
+            "provider_model": primary.provider_model,
+        }
         route_trace: dict[str, object] = {
             "stage": "routing",
             "event": "free_claude_code.api.route.resolved",
@@ -392,6 +405,8 @@ class ProviderExecutor:
                             continue
                         if not candidate_committed:
                             candidate_committed = True
+                            observatory_state["provider_id"] = target.provider_id
+                            observatory_state["provider_model"] = target.provider_model
                             if index > 0:
                                 self._trace_fallback_selected(
                                     request_id=request_id,
@@ -448,7 +463,7 @@ class ProviderExecutor:
         if self._generation_id is not None:
             stream_trace["generation_id"] = self._generation_id
 
-        return traced_async_stream(
+        traced = traced_async_stream(
             provider_body(),
             stage="egress",
             source="api",
@@ -465,3 +480,220 @@ class ProviderExecutor:
             chunk_event=None,
             extra=stream_trace,
         )
+        return self._observatory_wrap(
+            traced,
+            wire_api=wire_api,
+            request_id=request_id,
+            local_input_tokens=local_input_tokens,
+            endpoint=endpoint,
+            observatory_state=observatory_state,
+            gateway_model=gateway_model,
+        )
+
+    def _observatory_wrap(
+        self,
+        body: AsyncIterator[str],
+        *,
+        wire_api: WireApi,
+        request_id: str,
+        local_input_tokens: int | None,
+        endpoint: str,
+        observatory_state: dict[str, object],
+        gateway_model: str,
+    ) -> AsyncIterator[str]:
+        """Wrap the executed stream in a passive observatory tap.
+
+        For the Anthropic-SSE wire (messages) the tap decodes usage metadata
+        and emits the event itself. For the Responses wire the SSE framing
+        differs, so a minimal forwarder emits a request-shape-only event
+        (provider / model / duration / local estimate, no provider usage).
+        Both forwarders delegate ``aclose`` / ``athrow`` so the executor keeps
+        the exact stream-lifecycle contract it exposed before this wrap.
+        """
+
+        from free_claude_code.core.observatory import ObservatoryTap
+
+        provider_id = str(observatory_state.get("provider_id"))
+        if wire_api == "messages":
+            tap = ObservatoryTap(
+                body,
+                endpoint=endpoint,
+                provider=provider_id,
+                model=str(gateway_model),
+                request_id=request_id,
+                generation_id=self._generation_id,
+                local_input_tokens=local_input_tokens,
+                streaming=True,
+                observatory_state=observatory_state,
+            )
+            return _ObservatoryForward(tap)
+
+        return _ResponsesObservatoryForward(
+            body,
+            request_id=request_id,
+            endpoint=endpoint,
+            provider=provider_id,
+            model=str(gateway_model),
+            generation_id=self._generation_id,
+            local_input_tokens=local_input_tokens,
+            observatory_state=observatory_state,
+        )
+
+
+class _ObservatoryForward:
+    """Transparent pass-through that preserves the iterator's lifecycle.
+
+    Delegates iteration, ``aclose``, and ``athrow`` to the wrapped tap so the
+    consumer observes the same behaviour as before the observatory was added.
+    """
+
+    def __init__(self, body: AsyncIterator[str]) -> None:
+        self._body = body
+
+    def __aiter__(self) -> "_ObservatoryForward":
+        return self
+
+    async def __anext__(self) -> str:
+        return await anext(self._body)
+
+    async def aclose(self) -> None:
+        close = getattr(self._body, "aclose", None)
+        if close is not None:
+            await close()
+
+    def athrow(self, *args: object, **kwargs: object) -> str:
+        athrow = getattr(self._body, "athrow", None)
+        if athrow is None:
+            raise RuntimeError("wrapped stream does not support athrow")
+        return athrow(*args, **kwargs)
+
+
+class _ResponsesObservatoryForward:
+    """Observatory forwarder for the Responses wire.
+
+    Passes every chunk through byte-for-byte and emits exactly one observatory
+    event, on normal end, error, or early close. On a clean end it reads the
+    provider-reported ``usage`` from the terminal ``response.completed`` /
+    ``response.incomplete`` SSE event the pipeline already produced (native
+    relay passes it through; the Chat-to-Responses path builds it) and layers
+    it onto the event. It never re-frames, mutates, or re-orders chunks, and a
+    failure in the observation path can never change or break the stream.
+    Delegates ``aclose`` / ``athrow`` to the body.
+    """
+
+    def __init__(
+        self,
+        body: AsyncIterator[str],
+        *,
+        request_id: str,
+        endpoint: str,
+        provider: str,
+        model: str,
+        generation_id: int | None,
+        local_input_tokens: int | None,
+        observatory_state: Mapping[str, object] | None = None,
+    ) -> None:
+        self._body = body
+        self._request_id = request_id
+        self._endpoint = endpoint
+        self._provider = provider
+        self._model = model
+        self._generation_id = generation_id
+        self._local_input_tokens = local_input_tokens
+        self._observatory_state = observatory_state
+        self._emitted = False
+        self._start: float | None = None
+        self._sse: list[str] = []
+
+    def __aiter__(self) -> "_ResponsesObservatoryForward":
+        if self._start is None:
+            self._start = monotonic()
+        return self
+
+    async def __anext__(self) -> str:
+        # Capture the start on first iteration. ``__aiter__`` may be bypassed
+        # when a consumer drives this forwarder via ``anext()`` directly, so
+        # this is the guaranteed entry point.
+        if self._start is None:
+            self._start = monotonic()
+        try:
+            chunk = await anext(self._body)
+        except StopAsyncIteration:
+            # Clean end of the provider stream: emit the ok event, then
+            # propagate so the consumer observes the same termination as it
+            # would without the observatory.
+            self._emit("ok")
+            raise
+        # Retain only the terminal region; the usage lives in the final
+        # response.completed / response.incomplete event. Capping the buffer
+        # keeps observation memory bounded for long streams.
+        self._sse.append(chunk)
+        if len(self._sse) > 64:
+            self._sse = self._sse[-64:]
+        return chunk
+
+    async def aclose(self) -> None:
+        close = getattr(self._body, "aclose", None)
+        if close is not None:
+            await close()
+        self._emit("cancelled")
+
+    def athrow(self, *args: object, **kwargs: object) -> str:
+        athrow = getattr(self._body, "athrow", None)
+        if athrow is None:
+            raise RuntimeError("wrapped stream does not support athrow")
+        return athrow(*args, **kwargs)
+
+    def _emit(self, outcome: str) -> None:
+        if self._emitted:
+            return
+        self._emitted = True
+        from free_claude_code.core.observatory import (
+            build_observatory_event,
+            emit_llm_request_event,
+            extract_responses_terminal_usage,
+        )
+
+        duration_ms = (monotonic() - self._start) * 1000 if self._start else 0.0
+        provider_usage = None
+        if outcome == "ok":
+            try:
+                provider_usage, _ = extract_responses_terminal_usage(
+                    "".join(self._sse)
+                )
+            except Exception:
+                provider_usage = None
+        # Resolve the final serving provider / provider model from the live
+        # state at emit time (post-fallback), falling back to the constructor
+        # values when the executor did not share its state dict.
+        provider = self._provider
+        provider_model: str | None = None
+        if isinstance(self._observatory_state, Mapping):
+            final_provider = self._observatory_state.get("provider_id")
+            if isinstance(final_provider, str) and final_provider:
+                provider = final_provider
+            final_model = self._observatory_state.get("provider_model")
+            if isinstance(final_model, str) and final_model:
+                provider_model = final_model
+        error_type = None if outcome == "ok" else outcome
+        try:
+            emit_llm_request_event(
+                build_observatory_event(
+                    request_id=self._request_id,
+                    endpoint=self._endpoint,
+                    provider=provider,
+                    model=self._model,
+                    wire_api="responses",
+                    streaming=True,
+                    duration_ms=duration_ms,
+                    generation_id=self._generation_id,
+                    http_status=200 if outcome == "ok" else 500,
+                    local_input_tokens=self._local_input_tokens,
+                    provider_model=provider_model,
+                    provider_usage=provider_usage,
+                    error_type=error_type,
+                    error_message=None if outcome == "ok" else error_type,
+                )
+            )
+        except Exception:
+            pass
