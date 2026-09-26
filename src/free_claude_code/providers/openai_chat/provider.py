@@ -78,6 +78,7 @@ class OpenAIChatProvider(BaseProvider):
             read_timeout_s=config.http_read_timeout,
             log_raw_sse_events=config.log_raw_sse_events,
             log_api_error_tracebacks=config.log_api_error_tracebacks,
+            provider_diagnostics=config.provider_diagnostics,
             endpoint_transport=endpoint_transport,
         )
 

@@ -638,6 +638,12 @@ class Settings(BaseModel):
     log_raw_sse_events: bool = Field(
         default=False, validation_alias="LOG_RAW_SSE_EVENTS"
     )
+    # When true, log redacted structural provider-diagnostic events (outbound
+    # request shape, error bodies/status) around OpenAI-compatible transport
+    # calls. Never logs messages, tools, credentials, or authorization values.
+    provider_diagnostics: bool = Field(
+        default=False, validation_alias="PROVIDER_DIAGNOSTICS"
+    )
     # When false (default), unhandled exceptions log only type + route metadata (no message/traceback).
     log_api_error_tracebacks: bool = Field(
         default=False, validation_alias="LOG_API_ERROR_TRACEBACKS"

@@ -585,6 +585,7 @@ async def test_retryable_preframe_failure_selects_fallback_after_closing_primary
         "failure_kind": "overloaded",
         "status_code": 529,
         "provider_retryable": True,
+        "provider_error_message": "primary overloaded",
         "generation_id": 7,
     }
     selected = next(

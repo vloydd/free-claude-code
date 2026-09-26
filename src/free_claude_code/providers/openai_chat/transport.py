@@ -3,6 +3,7 @@
 import asyncio
 import sys
 import uuid
+from time import monotonic
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -37,6 +38,11 @@ from free_claude_code.core.anthropic.streaming import (
 from free_claude_code.core.diagnostics import (
     exception_cause_types,
     redacted_exception_traceback,
+)
+from free_claude_code.core.provider_diagnostics import (
+    error_response_shape,
+    outbound_request_shape,
+    redact_base_url,
 )
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.history_replay import prepare_history
@@ -137,6 +143,17 @@ class _CollectedRecoveryOutput:
     thinking: str
     tool_calls: tuple[CompletedOpenAIToolCall, ...]
     request_body: JsonObject
+
+
+def _client_base_url(client: Any) -> str:
+    """Return a URL string from an OpenAI client without raising."""
+    try:
+        base_url = getattr(client, "base_url", None)
+        if base_url is None:
+            return ""
+        return str(base_url)
+    except Exception:
+        return ""
 
 
 def _iter_visible_text_events(
@@ -531,6 +548,7 @@ class OpenAIChatTransport:
         read_timeout_s: float,
         log_raw_sse_events: bool,
         log_api_error_tracebacks: bool,
+        provider_diagnostics: bool = False,
         endpoint_transport: httpx2.AsyncBaseTransport | None = None,
     ) -> None:
         self._client = client
@@ -541,8 +559,81 @@ class OpenAIChatTransport:
         self._read_timeout_s = read_timeout_s
         self._log_raw_sse_events = log_raw_sse_events
         self._log_api_error_tracebacks = log_api_error_tracebacks
+        self._provider_diagnostics = provider_diagnostics
         self._endpoint_transport = endpoint_transport
         self._model_output_caps: dict[str, int] = {}
+
+    def _emit_diag(self, event: str, **fields: object) -> None:
+        """Emit one opt-in, credential-safe provider diagnostic trace.
+
+        Observational only: any failure here is swallowed so diagnostics can
+        never change or break the request path.
+        """
+        if not self._provider_diagnostics:
+            return
+        try:
+            trace_event(
+                stage="provider",
+                event=event,
+                source="provider",
+                provider=self._provider_name,
+                diag=True,
+                **fields,
+            )
+        except (Exception, BaseException):  # noqa: BLE001 - diagnostic must not break the stream
+            pass
+
+    def _emit_attempt_failed(
+        self,
+        error: Exception,
+        execution: Any,
+        body: Mapping[str, Any],
+    ) -> None:
+        """Emit a redacted per-attempt failure with the provider error detail."""
+        if not self._provider_diagnostics:
+            return
+        try:
+            reported = underlying_provider_error(error)
+            failure = classify_provider_failure(
+                reported,
+                provider_name=self._provider_name,
+                read_timeout_s=self._read_timeout_s,
+                request_id=execution.request_id,
+                provider_failure_override=self._behavior.failure_override,
+            )
+            response_shape = error_response_shape(reported)
+            fields: dict[str, object] = {
+                "request_id": execution.request_id,
+                "exc_type": type(reported).__name__,
+                "failure_kind": failure.kind.value,
+                "http_status": failure.status_code,
+                "retryable": failure.retryable,
+                "attempt": execution.attempts_started,
+                "max_attempts": execution.max_attempts,
+                "gateway_model": body.get("model"),
+            }
+            if isinstance(response_shape, dict):
+                for key in (
+                    "provider_error_type",
+                    "provider_error_code",
+                    "provider_error_message",
+                ):
+                    value = response_shape.get(key)
+                    if value is not None:
+                        fields[key] = value
+                fields["response"] = {
+                    k: v
+                    for k, v in response_shape.items()
+                    if k
+                    not in {
+                        "provider_error_type",
+                        "provider_error_code",
+                        "provider_error_message",
+                    }
+                }
+            self._emit_diag("provider.attempt.failed", **fields)
+        except (Exception, BaseException):  # noqa: BLE001 - diagnostic must not break the stream
+            pass
 
     def _log_stream_transport_error(
         self,
@@ -703,6 +794,20 @@ class OpenAIChatTransport:
                         structured_details=self._profile.structured_reasoning_details,
                     ),
                 )
+                self._emit_diag(
+                    "provider.attempt.started",
+                    request_id=execution.request_id,
+                    http_method="POST",
+                    gateway_model=body.get("model"),
+                    stream=True,
+                    attempt=execution.attempts_started,
+                    max_attempts=execution.max_attempts,
+                    operation_kind=operation_kind.value,
+                    base_url=redact_base_url(_client_base_url(client)),
+                    outbound=outbound_request_shape(
+                        create_body if isinstance(create_body, dict) else body
+                    ),
+                )
                 stream = OpenAIStreamAdapter(
                     await client.chat.completions.create(
                         **create_body,
@@ -710,11 +815,19 @@ class OpenAIChatTransport:
                     )
                 )
                 stream = self._behavior.normalize_stream(stream, body)
+                self._emit_diag(
+                    "provider.attempt.response",
+                    request_id=execution.request_id,
+                    http_status=200,
+                    attempt=execution.attempts_started,
+                    gateway_model=body.get("model"),
+                )
                 retain_attempt = True
                 return stream, body, attempt, create_body
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                self._emit_attempt_failed(error, execution, body)
                 retry_body = await request_recovery.retry_request(
                     error,
                     provider_authentication_status(error),
@@ -1025,6 +1138,9 @@ class _OpenAIChatStreamRunner:
             body=provider_chat_body_snapshot(body),
         )
 
+        diag_start: float | None = None
+        chunk_count = 0
+        total_bytes = 0
         while True:
             assembler = self._new_stream_assembler(output_reasoning=output_reasoning)
             scope: ProviderAttemptScope | None = None
@@ -1054,9 +1170,18 @@ class _OpenAIChatStreamRunner:
                     else None,
                 )
                 assembler.bind_tool_argument_aliases(self._tool_argument_aliases)
+                diag_start = monotonic() if self._transport._provider_diagnostics else None
+                chunk_count = 0
+                total_bytes = 0
                 async for chunk in stream:
                     if not scope.attempt.accepted:
                         await scope.attempt.accept()
+                    if diag_start is not None:
+                        chunk_count += 1
+                        try:
+                            total_bytes += len(str(chunk))
+                        except Exception:
+                            pass
                     for event in assembler.start_events():
                         for out_event in hold_event(event):
                             yield out_event
@@ -1121,6 +1246,21 @@ class _OpenAIChatStreamRunner:
             for out_event in hold_event(event):
                 yield out_event
         completion = assembler.completion
+        if self._transport._provider_diagnostics and diag_start is not None:
+            self._transport._emit_diag(
+                "provider.response",
+                request_id=self._request_id,
+                http_status=200,
+                completed=True,
+                chunk_count=chunk_count,
+                total_bytes=total_bytes,
+                duration_ms=(monotonic() - diag_start) * 1000,
+                terminal_event=(
+                    None
+                    if completion.finish_reason is None
+                    else str(completion.finish_reason)
+                ),
+            )
         if completion.provider_input_tokens is not None:
             logger.debug(
                 "TOKEN_ESTIMATE: our={} provider={} diff={:+d}",

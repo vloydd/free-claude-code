@@ -23,6 +23,7 @@ from free_claude_code.core.openai_responses import (
     estimate_responses_input_tokens,
 )
 from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.core.diagnostics import extract_upstream_error_detail
 from free_claude_code.core.trace import (
     close_stream_input,
     trace_event,
@@ -36,6 +37,29 @@ from .routing import (
     RoutedMessagesRequest,
     RoutedResponsesRequest,
 )
+
+_FAILURE_DETAIL_CAP_BYTES = 1_024
+
+
+def _failure_upstream_detail(failure: ExecutionFailure) -> str | None:
+    """Best-effort provider error message from a finalized execution failure.
+
+    The failure's message already embeds the redacted upstream response body
+    (via ``format_execution_failure_message``). When it clearly contains an
+    upstream error section, return that detail (capped); otherwise fall back to
+    the failure's own message. Never throws.
+    """
+    try:
+        detail = extract_upstream_error_detail(failure)
+        if detail.body_text is not None:
+            return detail.body_text[:_FAILURE_DETAIL_CAP_BYTES]
+        message = getattr(failure, "message", None)
+        if isinstance(message, str) and message.strip():
+            return message.strip()[:_FAILURE_DETAIL_CAP_BYTES]
+    except (Exception, BaseException):  # noqa: BLE001 - diagnostics must not break fallback
+        pass
+    return None
+
 
 TokenCounter = Callable[
     [list[Message], str | list[SystemContent] | None, list[Tool] | None],
@@ -124,6 +148,9 @@ class ProviderExecutor:
             "status_code": failure.status_code,
             "provider_retryable": failure.retryable,
         }
+        detail = _failure_upstream_detail(failure)
+        if detail is not None:
+            fields["provider_error_message"] = detail
         if self._generation_id is not None:
             fields["generation_id"] = self._generation_id
         trace_event(**fields)

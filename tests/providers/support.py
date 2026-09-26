@@ -61,6 +61,7 @@ def make_provider_config(
     proxy: str | None = None,
     log_raw_sse_events: bool = False,
     log_api_error_tracebacks: bool = False,
+    provider_diagnostics: bool = False,
 ) -> ProviderConfig:
     """Build a complete resolved config for isolated provider tests."""
 
@@ -76,6 +77,7 @@ def make_provider_config(
         proxy=proxy,
         log_raw_sse_events=log_raw_sse_events,
         log_api_error_tracebacks=log_api_error_tracebacks,
+        provider_diagnostics=provider_diagnostics,
     )
 
 
